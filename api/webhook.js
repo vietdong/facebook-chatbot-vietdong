@@ -1,93 +1,127 @@
 const fetch = require('node-fetch');
 
+// ─────────────────────────────────────────────────────────────────
+// WEBHOOK FACEBOOK MESSENGER → 9ROUTER DIRECT API (SIÊU TIẾT KIỆM TOKEN)
+// Không đi qua Hermes API Server để tránh load 18,000 prompt tokens.
+// Đi trực tiếp qua Cloudflare Tunnel kết nối tới 9router (cổng 20128).
+// ─────────────────────────────────────────────────────────────────
+
+const AI_BASE_URL = (process.env.AI_BASE_URL || "https://grateful-tvs-philip-graduate.trycloudflare.com/v1").replace(/\/$/, '');
+const NINE_ROUTER_URL = `${AI_BASE_URL}/chat/completions`;
+const NINE_ROUTER_API_KEY = "sk_9router"; // API Key nội bộ của 9router của bạn
+
 module.exports = async (req, res) => {
-    // Handle GET validation challenge from Facebook
+    // Xử lý GET verification từ Facebook
     if (req.method === 'GET') {
         const mode = req.query['hub.mode'];
         const token = req.query['hub.verify_token'];
         const challenge = req.query['hub.challenge'];
-        
         const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'hermes_bot_verify_token';
         
-        if (mode && token) {
-            if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-                console.log('WEBHOOK_VERIFIED');
-                return res.status(200).send(challenge);
-            } else {
-                return res.status(403).send('Forbidden');
-            }
+        if (mode === 'subscribe' && token === VERIFY_TOKEN && challenge) {
+            console.log('WEBHOOK_VERIFIED');
+            return res.status(200).send(challenge);
         }
+        return res.status(403).send('Forbidden');
     }
 
-    // Handle incoming POST messaging webhook
+    // Xử lý POST tin nhắn từ Facebook
     if (req.method === 'POST') {
         const body = req.body;
-        
-        if (body.object === 'page') {
-            for (const entry of body.entry) {
-                const webhook_event = entry.messaging ? entry.messaging[0] : null;
-                if (!webhook_event) continue;
-                
-                const sender_psid = webhook_event.sender.id;
-                
-                if (webhook_event.message && webhook_event.message.text) {
-                    const text = webhook_event.message.text.trim();
-                    console.log(`Received message: "${text}" from PSID: ${sender_psid}`);
-                    
-                    let replyText = "";
-                    const textLower = text.toLowerCase();
 
-                    // Smart interactive menu responses
-                    if (textLower.includes("alo") || textLower.includes("chào") || textLower.includes("hello") || textLower.includes("hi")) {
-                        replyText = "Xin chào! Cửa hàng Zenn Salon xin chào bạn. Chúng tôi có thể giúp gì cho bạn?\n\n1. Tư vấn kiểu tóc phù hợp\n2. Đặt lịch hẹn cắt/uốn/nhuộm\n3. Xem bảng giá dịch vụ\n\nBạn chỉ cần soạn số (1, 2, 3) để chọn nhé!";
-                    } else if (text === "1") {
-                        replyText = "Để nhận tư vấn kiểu tóc phù hợp, bạn hãy truy cập ngay ứng dụng tư vấn trực quan của chúng tôi tại đây nhé: https://hair-consult-booking.vercel.app/ (Chọn tab Tư Vấn)";
-                    } else if (text === "2") {
-                        replyText = "Để đặt lịch hẹn nhanh nhất, giữ chỗ với Stylist bạn yêu thích, hãy truy cập link này nhé: https://hair-consult-booking.vercel.app/ (Chọn tab Đặt Lịch)";
-                    } else if (text === "3") {
-                        replyText = "Bảng giá dịch vụ Zenn Salon:\n- Cắt tóc tạo kiểu (Combo 7 bước): 100k\n- Uốn xoăn Comma Hair: 300k\n- Uốn Texture Hàn Quốc: 350k\n- Nhuộm màu thời trang: 400k";
-                    } else {
-                        // Default fallback
-                        replyText = "Cảm ơn bạn đã nhắn tin. Yêu cầu của bạn đã được ghi nhận, nhân viên Zenn Salon sẽ liên hệ và chat trực tiếp với bạn ngay trong giây lát!";
+        if (body.object === 'page' && body.entry) {
+            for (const entry of body.entry) {
+                const events = entry.messaging || [];
+                for (const event of events) {
+                    const sender_psid = event.sender?.id;
+                    const message = event.message?.text?.trim();
+
+                    if (sender_psid && message) {
+                        console.log(`[FB] From ${sender_psid}: "${message}"`);
+                        
+                        // Xử lý và gửi phản hồi không chặn luồng (fire & forget)
+                        replyAsync(sender_psid, message).catch(e => console.error('Reply error:', e));
                     }
-                    
-                    await callSendAPI(sender_psid, replyText);
                 }
             }
             return res.status(200).send('EVENT_RECEIVED');
-        } else {
-            return res.status(404).send('Not Found');
         }
+        return res.status(404).send('Not Found');
     }
 
     return res.status(405).send('Method Not Allowed');
 };
 
-async function callSendAPI(sender_psid, responseText) {
-    const pageAccessToken = process.env.FB_PAGE_ACCESS_TOKEN;
-    if (!pageAccessToken) {
-        console.error('Missing FB_PAGE_ACCESS_TOKEN env variable.');
-        return;
-    }
+async function replyAsync(sender_psid, userMessage) {
+    const reply = await call9Router(userMessage);
+    await sendToFacebook(sender_psid, reply);
+}
 
-    const request_body = {
-        recipient: { id: sender_psid },
-        message: { text: responseText }
+async function call9Router(userMessage) {
+    const payload = {
+        model: "ag/gemini-3.5-flash-low",
+        messages: [
+            {
+                role: "system",
+                content: "Bạn là trợ lý AI thông minh đại diện cho tiệm tóc Zenn Salon. Trả lời cực kỳ ngắn gọn, thân thiện, tự nhiên bằng tiếng Việt (dưới 100 từ). Tư vấn nhanh về cắt/uốn/nhuộm tóc."
+            },
+            {
+                role: "user",
+                content: userMessage
+            }
+        ],
+        max_tokens: 150,
+        temperature: 0.7,
+        stream: false
     };
 
     try {
-        const res = await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${pageAccessToken}`, {
+        const response = await fetch(NINE_ROUTER_URL, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(request_body)
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${NINE_ROUTER_API_KEY}`
+            },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(15000)
         });
-        if (res.ok) {
-            console.log('Message sent to PSID:', sender_psid);
+
+        if (response.ok) {
+            const data = await response.json();
+            const reply = data?.choices?.[0]?.message?.content?.trim();
+            if (reply) return reply;
         } else {
-            const errData = await res.json();
-            console.error('Meta Graph Send API Error:', errData);
+            const errText = await response.text();
+            console.error('9router error:', response.status, errText.slice(0, 200));
         }
-    } catch (err) {
-        console.error('Meta Graph Request failed:', err);
+    } catch (e) {
+        console.error('9router fetch error:', e.message);
+    }
+
+    return "Cửa hàng Zenn Salon xin chào bạn! Yêu cầu của bạn đã được ghi nhận. Stylist sẽ liên hệ hỗ trợ bạn trực tiếp ngay nhé!";
+}
+
+async function sendToFacebook(sender_psid, text) {
+    const token = process.env.FB_PAGE_ACCESS_TOKEN;
+    if (!token) return;
+
+    try {
+        const response = await fetch(
+            `https://graph.facebook.com/v19.0/me/messages?access_token=${token}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    recipient: { id: sender_psid },
+                    message: { text }
+                })
+            }
+        );
+        if (!response.ok) {
+            const err = await response.text();
+            console.error('Facebook send error:', err.slice(0, 200));
+        }
+    } catch (e) {
+        console.error('Facebook send failed:', e.message);
     }
 }
